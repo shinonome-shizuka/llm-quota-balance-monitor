@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["rumps"]
+# dependencies = ["rumps; sys_platform == 'darwin'"]
 # ///
 """LLM Quota Balance Monitor — macOS menu bar app."""
 
@@ -1008,6 +1008,175 @@ def print_status():
             print(f"  Error: {e}")
 
 
+# --- Headless daemon mode (Linux / Omarchy bar widget) -----------------------
+# Writes a compact JSON state file that the Omarchy bar widget watches.
+
+STATE_DIR = Path(
+    os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+) / "llm-quota-monitor"
+STATE_FILE = STATE_DIR / "state.json"
+
+
+def fetch_all(cfg):
+    """Fetch every provider once. Returns {name: (data, error)}."""
+    disabled = (None, "Disabled")
+    calls = [
+        ("deepseek", lambda: fetch_deepseek(cfg["deepseek_api_key"])),
+        ("minimax", lambda: fetch_minimax(cfg["minimax_subscription_key"])),
+        ("aikeybest", lambda: fetch_aikeybest(cfg["aikeybest_token"])),
+        ("niumacode", lambda: fetch_niumacode(cfg["niumacode_api_key"])),
+        ("kimi", lambda: fetch_kimi(cfg["kimi_api_key"])),
+        ("glm", lambda: fetch_glm(cfg["glm_api_key"])),
+        ("codex", lambda: fetch_codex()),
+    ]
+    out = {}
+    for name, fn in calls:
+        if not is_enabled(cfg, name):
+            out[name] = disabled
+            continue
+        try:
+            out[name] = fn()
+        except Exception as e:
+            out[name] = None, str(e)
+    return out
+
+
+def build_compact_text(cfg, res):
+    """Same format as the macOS menu bar title."""
+    parts = []
+    ds, mm = res["deepseek"], res["minimax"]
+    ak, nm = res["aikeybest"], res["niumacode"]
+    km, glm, cx = res["kimi"], res["glm"], res["codex"]
+    if is_enabled(cfg, "deepseek"):
+        parts.append(f"DS:¥{ds[0]['total']}" if ds[0] else "DS:--")
+    if is_enabled(cfg, "minimax"):
+        parts.append(f"MM:{mm[0]['avg_pct']}%" if mm[0] else "MM:--")
+    if is_enabled(cfg, "aikeybest"):
+        if ak[0]:
+            total = ak[0].get("total", 0)
+            pct = int(ak[0].get("available", 0) / total * 100) if total > 0 else 0
+            parts.append(f"AK:{pct}%")
+        else:
+            parts.append("AK:--")
+    if is_enabled(cfg, "niumacode"):
+        parts.append(f"NM:{nm[0]['balance']:.2f}" if nm[0] else "NM:--")
+    if is_enabled(cfg, "kimi"):
+        if km[0]:
+            rows = km[0].get("rows", [])
+            if _kimi_total_quota_exhausted(km[0]):
+                parts.append("KM:OUT")
+            elif rows:
+                parts.append(f"KM:{100 - rows[0]['percent']}%")
+            else:
+                parts.append("KM:--")
+        else:
+            parts.append("KM:--")
+    if is_enabled(cfg, "glm"):
+        parts.append(f"GLM:{glm[0]['pct']}%" if glm[0] else "GLM:--")
+    if is_enabled(cfg, "codex"):
+        parts.append(("CX:OUT" if cx[0]["exhausted"] else f"CX:{cx[0]['remaining_pct']}%") if cx[0] else "CX:--")
+    return " ".join(parts)
+
+
+def build_tooltip(cfg, res):
+    """Multi-line detail text, mirroring the macOS dropdown menu."""
+    lines = []
+    ds, mm = res["deepseek"], res["minimax"]
+    ak, nm = res["aikeybest"], res["niumacode"]
+    km, glm, cx = res["kimi"], res["glm"], res["codex"]
+    if is_enabled(cfg, "deepseek"):
+        if ds[0]:
+            d = ds[0]
+            lines.append(f"DeepSeek: ¥{d['total']} ({d['currency']})")
+            if float(d["granted"]) > 0:
+                lines.append(f"  Granted: ¥{d['granted']}")
+            lines.append(f"  Topped up: ¥{d['topped_up']}")
+        else:
+            lines.append(f"DeepSeek: {ds[1] or 'N/A'}")
+    if is_enabled(cfg, "minimax"):
+        if mm[0]:
+            lines.append(f"MiniMax: {mm[0]['avg_pct']}%")
+            for m in mm[0]["models"]:
+                if m["name"] == "general" and m.get("reset_at"):
+                    lines.append(f"  reset: {m['reset_at']}")
+                    break
+        else:
+            lines.append(f"MiniMax: {mm[1] or 'N/A'}")
+    if is_enabled(cfg, "aikeybest"):
+        if ak[0]:
+            total = ak[0].get("total", 0)
+            pct = int(ak[0].get("available", 0) / total * 100) if total > 0 else 0
+            lines.append(f"AiKeyBest: {pct}% remaining ({format_number(ak[0].get('available', 0))}/{format_number(total)})")
+        else:
+            lines.append(f"AiKeyBest: {ak[1] or 'N/A'}")
+    if is_enabled(cfg, "niumacode"):
+        if nm[0]:
+            lines.append(f"NiuMaCode: {nm[0]['balance']:.2f} {nm[0]['unit']}")
+            if nm[0].get("plan"):
+                lines.append(f"  Plan: {nm[0]['plan']}")
+        else:
+            lines.append(f"NiuMaCode: {nm[1] or 'N/A'}")
+    if is_enabled(cfg, "kimi"):
+        if km[0]:
+            rows = km[0].get("rows", [])
+            if _kimi_total_quota_exhausted(km[0]):
+                lines.append("Kimi: OUT (monthly quota exhausted)")
+            elif rows:
+                main = rows[0]
+                lines.append(f"Kimi Weekly: {100 - main['percent']}% remaining ({main['used']}/{main['limit']})")
+                if main.get("reset_at"):
+                    lines.append(f"  Reset: {main['reset_at']} ({main['countdown']})")
+            else:
+                lines.append("Kimi: no data")
+        else:
+            lines.append(f"Kimi: {km[1] or 'N/A'}")
+    if is_enabled(cfg, "glm"):
+        if glm[0]:
+            lines.append(f"GLM: {glm[0]['pct']}% remaining ({format_number(glm[0]['used'])}/{format_number(glm[0]['limit'])})")
+        else:
+            lines.append(f"GLM: {glm[1] or 'N/A'}")
+    if is_enabled(cfg, "codex"):
+        if cx[0]:
+            d = cx[0]
+            lines.append("Codex: OUT" if d["exhausted"] else f"Codex: {d['remaining_pct']}% remaining")
+            if d.get("account_name"):
+                lines.append(f"  Account: {d['account_name']} ({str(d['plan']).title()})")
+        else:
+            lines.append(f"Codex: {cx[1] or 'N/A'}")
+    return "\n".join(lines)
+
+
+def collect_state():
+    cfg = load_config()
+    res = fetch_all(cfg)
+    return {
+        "updated": int(time.time()),
+        "text": build_compact_text(cfg, res),
+        "tooltip": build_tooltip(cfg, res),
+    }
+
+
+def write_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_name("state.json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False))
+    tmp.replace(STATE_FILE)
+
+
+def run_daemon():
+    ensure_config()
+    while True:
+        try:
+            write_state(collect_state())
+        except Exception as e:
+            write_state({
+                "updated": int(time.time()),
+                "text": "LLM:ERR",
+                "tooltip": f"monitor error: {e}",
+            })
+        time.sleep(REFRESH_INTERVAL)
+
+
 if __name__ == "__main__":
     if "--status" in sys.argv:
         if ensure_config():
@@ -1015,6 +1184,20 @@ if __name__ == "__main__":
             print("Please fill in your API keys and run again.")
             sys.exit(0)
         print_status()
+        sys.exit(0)
+    if "--once" in sys.argv:
+        # One-shot headless fetch: refresh the state file and print the pill text.
+        if ensure_config():
+            print(f"Config created at {CONFIG_FILE}")
+            print("Please fill in your API keys and run again.")
+            sys.exit(0)
+        state = collect_state()
+        write_state(state)
+        print(state["text"])
+        sys.exit(0)
+    if "--daemon" in sys.argv:
+        # Headless refresh loop for the Linux/Omarchy bar widget (no rumps).
+        run_daemon()
         sys.exit(0)
     if rumps is None:
         sys.exit("rumps not installed; run via start.sh which uses uv")
