@@ -1,0 +1,14 @@
+[Unit]
+Description=LLM quota monitor for the Omarchy bar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/llm-quota-balance-monitor
+ExecStart=/usr/bin/python3 %h/Projects/llm-quota-balance-monitor/monitor.py --daemon
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

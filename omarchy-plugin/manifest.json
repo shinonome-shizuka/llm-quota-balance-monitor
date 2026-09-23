@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "shinonome.llm-quota",
+  "name": "LLM Quota",
+  "version": "1.0.0",
+  "author": "shinonome-shizuka",
+  "license": "MIT",
+  "description": "LLM provider quota/balance pill, fed by monitor.py --daemon (llm-quota-balance-monitor).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "LLM Quota",
+    "description": "DeepSeek/MiniMax/AiKeyBest/NiuMaCode/Kimi/GLM/Codex balances from llm-quota-balance-monitor",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "homepage": "https://github.com/shinonome-shizuka/llm-quota-balance-monitor"
+}
