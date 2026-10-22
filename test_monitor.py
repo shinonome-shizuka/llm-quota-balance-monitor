@@ -204,5 +204,105 @@ class CodexUsageTests(unittest.TestCase):
         self.assertTrue(data["exhausted"])
 
 
+class TypeSafeBalanceTests(unittest.TestCase):
+    def setUp(self):
+        monitor._typesafe_action_cache.update({"id": None, "expires_at": 0.0})
+
+    def test_parses_billing_balance_and_credits(self):
+        body = '\n'.join([
+            '0:{"a":"$@1"}',
+            '1:{"ok":true,"data":{"billing":{"plan":"free_plan","spent":0.01,'
+            '"balance":4.98,"cycleLabel":"September 2026","credits":[{"amount":5,'
+            '"remaining":4.98,"expiresAt":"2026-10-19T00:00:00Z"}]}}}',
+        ])
+
+        data, error = monitor._parse_typesafe_billing(body)
+
+        self.assertIsNone(error)
+        self.assertEqual(data["balance"], 4.98)
+        self.assertEqual(data["spent"], 0.01)
+        self.assertEqual(data["plan"], "Free")
+        self.assertEqual(data["cycle"], "September 2026")
+        self.assertEqual(data["credits"][0]["remaining"], 4.98)
+
+    def test_zero_balance_is_valid(self):
+        body = '1:{"ok":true,"data":{"billing":{"spent":5,"balance":0}}}'
+
+        data, error = monitor._parse_typesafe_billing(body)
+
+        self.assertIsNone(error)
+        self.assertEqual(data["balance"], 0.0)
+
+    def test_missing_numeric_balance_is_rejected(self):
+        body = '1:{"ok":true,"data":{"billing":{"spent":1,"balance":null}}}'
+
+        data, error = monitor._parse_typesafe_billing(body)
+
+        self.assertIsNone(data)
+        self.assertEqual(error, "TypeSafe balance missing")
+
+    def test_empty_cookie_does_not_make_network_request(self):
+        with patch("monitor._typesafe_cookie_from_keychain", return_value=""):
+            data, error = monitor.fetch_typesafe("")
+
+        self.assertIsNone(data)
+        self.assertEqual(error, "No console Cookie header")
+
+    @patch("monitor._typesafe_cookie_from_keychain", return_value="session=from-keychain")
+    @patch("monitor._typesafe_request")
+    @patch("monitor._discover_typesafe_action", return_value=("c" * 40, None))
+    @patch("monitor.time.monotonic", return_value=1000)
+    def test_uses_keychain_cookie_when_config_is_empty(
+        self, monotonic, discover, request, keychain
+    ):
+        request.return_value = (
+            200,
+            {},
+            '1:{"ok":true,"data":{"billing":{"spent":0,"balance":3}}}',
+        )
+
+        data, error = monitor.fetch_typesafe("")
+
+        self.assertIsNone(error)
+        self.assertEqual(data["balance"], 3)
+        discover.assert_called_once_with("session=from-keychain")
+
+    @patch("monitor._typesafe_request")
+    @patch("monitor._discover_typesafe_action", return_value=("b" * 40, None))
+    @patch("monitor.time.monotonic", return_value=1000)
+    def test_accepts_cookie_header_prefix(self, monotonic, discover, request):
+        request.return_value = (
+            200,
+            {},
+            '1:{"ok":true,"data":{"billing":{"spent":0,"balance":5}}}',
+        )
+
+        data, error = monitor.fetch_typesafe("Cookie: first=one; second=two")
+
+        self.assertIsNone(error)
+        self.assertEqual(data["balance"], 5)
+        discover.assert_called_once_with("first=one; second=two")
+
+    @patch("monitor._typesafe_request")
+    @patch("monitor._discover_typesafe_action", return_value=("a" * 40, None))
+    @patch("monitor.time.monotonic", return_value=1000)
+    def test_fetch_posts_discovered_server_action(self, monotonic, discover, request):
+        request.return_value = (
+            200,
+            {"Content-Type": "text/x-component"},
+            '1:{"ok":true,"data":{"billing":{"spent":1.25,"balance":8.75}}}',
+        )
+
+        data, error = monitor.fetch_typesafe("session=value")
+
+        self.assertIsNone(error)
+        self.assertEqual(data["balance"], 8.75)
+        discover.assert_called_once_with("session=value")
+        _, kwargs = request.call_args
+        self.assertEqual(kwargs["method"], "POST")
+        self.assertEqual(kwargs["headers"]["Next-Action"], "a" * 40)
+        self.assertEqual(kwargs["data"], b"[]")
+
+
 if __name__ == "__main__":
     unittest.main()

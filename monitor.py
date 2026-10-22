@@ -8,6 +8,7 @@
 import json
 import os
 import queue
+import re
 import select
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -31,6 +33,8 @@ KIMI_OUT_TEST_ENV = "KIMI_SIMULATE_TOTAL_QUOTA_OUT"
 KIMI_OUT_PROBE_INTERVAL = 24 * 60 * 60
 _kimi_probe_cache = {}
 _kimi_probe_lock = threading.Lock()
+_typesafe_action_cache = {"id": None, "expires_at": 0.0}
+_typesafe_action_lock = threading.Lock()
 
 
 def ensure_config():
@@ -39,13 +43,14 @@ def ensure_config():
         return False
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps({
-        "enabled": ["deepseek", "minimax", "aikeybest", "niumacode", "kimi", "glm", "codex"],
+        "enabled": ["deepseek", "minimax", "aikeybest", "niumacode", "kimi", "glm", "codex", "typesafe"],
         "deepseek_api_key": "",
         "minimax_subscription_key": "",
         "aikeybest_token": "",
         "niumacode_api_key": "",
         "kimi_api_key": "",
-        "glm_api_key": ""
+        "glm_api_key": "",
+        "typesafe_cookie": ""
     }, indent=2))
     return True
 
@@ -53,7 +58,7 @@ def ensure_config():
 def load_config():
     cfg = json.loads(CONFIG_FILE.read_text())
     if "enabled" not in cfg:
-        cfg["enabled"] = ["deepseek", "minimax", "aikeybest", "niumacode", "kimi", "glm", "codex"]
+        cfg["enabled"] = ["deepseek", "minimax", "aikeybest", "niumacode", "kimi", "glm", "codex", "typesafe"]
     return cfg
 
 
@@ -614,6 +619,204 @@ def fetch_codex():
                 process.wait(timeout=2)
 
 
+TYPESAFE_BILLING_URL = "https://console.typesafe.ai/settings/billing"
+TYPESAFE_ORIGIN = "https://console.typesafe.ai"
+TYPESAFE_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+)
+TYPESAFE_KEYCHAIN_SERVICE = "llm-quota-balance-monitor.typesafe-cookie"
+TYPESAFE_KEYCHAIN_ACCOUNT = "typesafe"
+
+
+def _typesafe_cookie_from_keychain():
+    if sys.platform != "darwin" or shutil.which("security") is None:
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                "security", "find-generic-password", "-w",
+                "-s", TYPESAFE_KEYCHAIN_SERVICE,
+                "-a", TYPESAFE_KEYCHAIN_ACCOUNT,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _typesafe_request(url, cookie, method="GET", headers=None, data=None, timeout=10):
+    request_headers = {
+        "Cookie": cookie,
+        "User-Agent": TYPESAFE_USER_AGENT,
+        "Accept": "text/html",
+    }
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(
+        url, data=data, headers=request_headers, method=method)
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.status, dict(response.headers.items()), response.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers.items()), e.read().decode(errors="replace")
+
+
+def _typesafe_validate_response(status, body):
+    if status in (401, 403) or 300 <= status < 400:
+        return "TypeSafe session expired"
+    if status == 429:
+        return "TypeSafe rate limit reached"
+    if status == 408 or status >= 500:
+        return "TypeSafe billing unavailable"
+    if status < 200 or status >= 300:
+        return f"TypeSafe billing HTTP {status}"
+    # Next.js can return the login route with HTTP 200.
+    if re.search(r'\\?"\(auth\)\\?".*?\\?"login\\?"', body):
+        return "TypeSafe session expired"
+    return None
+
+
+def _discover_typesafe_action(cookie):
+    status, _, page = _typesafe_request(TYPESAFE_BILLING_URL, cookie)
+    error = _typesafe_validate_response(status, page)
+    if error:
+        return None, error
+    script_sources = re.findall(
+        r'<script\b[^>]*\bsrc=["\']([^"\']+)["\'][^>]*>', page, re.IGNORECASE)
+    seen = set()
+    for source in script_sources[:60]:
+        url = urllib.parse.urljoin(TYPESAFE_ORIGIN, source)
+        if not url.startswith(TYPESAFE_ORIGIN + "/") or not re.search(r"\.js(?:$|\?)", url, re.I):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        chunk_status, _, chunk = _typesafe_request(url, cookie, timeout=4)
+        if chunk_status == 429 or chunk_status == 408 or chunk_status >= 500:
+            return None, _typesafe_validate_response(chunk_status, chunk)
+        if not 200 <= chunk_status < 300:
+            continue
+        match = re.search(
+            r'"([0-9a-f]{40,})"[^)]{0,150}"getBillingOverviewResult"',
+            chunk,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1), None
+    return None, "TypeSafe billing action not found"
+
+
+def _parse_typesafe_billing(body):
+    result = None
+    for line in body.splitlines():
+        separator = line.find(":")
+        if separator < 1:
+            continue
+        try:
+            candidate = json.loads(line[separator + 1:])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(candidate, dict) and "ok" in candidate:
+            result = candidate
+            break
+    if not result or result.get("ok") is not True:
+        return None, "TypeSafe billing response invalid"
+    billing = (result.get("data") or {}).get("billing")
+    if not isinstance(billing, dict):
+        return None, "TypeSafe billing data missing"
+    balance = billing.get("balance")
+    spent = billing.get("spent")
+    if not isinstance(balance, (int, float)) or isinstance(balance, bool):
+        return None, "TypeSafe balance missing"
+    if not isinstance(spent, (int, float)) or isinstance(spent, bool):
+        return None, "TypeSafe spend missing"
+    plan = billing.get("plan") if isinstance(billing.get("plan"), str) else None
+    if plan:
+        plan = " ".join(part.capitalize() for part in re.split(r"[_-]+", plan) if part)
+        if plan == "Free Plan":
+            plan = "Free"
+    credits = []
+    for item in billing.get("credits") or []:
+        if not isinstance(item, dict):
+            continue
+        amount = item.get("amount")
+        remaining = item.get("remaining")
+        expires_at = item.get("expiresAt")
+        if (
+            isinstance(amount, (int, float))
+            and isinstance(remaining, (int, float))
+            and not isinstance(amount, bool)
+            and not isinstance(remaining, bool)
+            and remaining > 0
+            and isinstance(expires_at, str)
+        ):
+            credits.append({"amount": amount, "remaining": remaining, "expires_at": expires_at})
+    return {
+        "balance": float(balance),
+        "spent": float(spent),
+        "currency": "USD",
+        "cycle": billing.get("cycleLabel") if isinstance(billing.get("cycleLabel"), str) else None,
+        "plan": plan,
+        "credits": credits,
+    }, None
+
+
+def fetch_typesafe(cookie):
+    """Read TypeSafe balance from the signed-in console billing session."""
+    cookie = (cookie or _typesafe_cookie_from_keychain()).strip()
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie.split(":", 1)[1].strip()
+    if not cookie:
+        return None, "No console Cookie header"
+
+    with _typesafe_action_lock:
+        now = time.monotonic()
+        action_id = _typesafe_action_cache["id"]
+        if not action_id or now >= _typesafe_action_cache["expires_at"]:
+            action_id, error = _discover_typesafe_action(cookie)
+            if error:
+                return None, error
+            _typesafe_action_cache.update({"id": action_id, "expires_at": now + 12 * 60 * 60})
+
+    def post(current_action):
+        return _typesafe_request(
+            TYPESAFE_BILLING_URL,
+            cookie,
+            method="POST",
+            headers={
+                "Origin": TYPESAFE_ORIGIN,
+                "Next-Action": current_action,
+                "Accept": "text/x-component",
+                "Content-Type": "application/json",
+            },
+            data=b"[]",
+        )
+
+    status, headers, body = post(action_id)
+    lower_headers = {key.lower(): value for key, value in headers.items()}
+    if status == 404 and lower_headers.get("x-nextjs-action-not-found") == "1":
+        with _typesafe_action_lock:
+            action_id, error = _discover_typesafe_action(cookie)
+            if error:
+                return None, error
+            _typesafe_action_cache.update({"id": action_id, "expires_at": time.monotonic() + 12 * 60 * 60})
+        status, _, body = post(action_id)
+    error = _typesafe_validate_response(status, body)
+    if error:
+        return None, error
+    return _parse_typesafe_billing(body)
+
+
 if rumps is not None:
     class LLMMonitorApp(rumps.App):
         def __init__(self):
@@ -633,6 +836,8 @@ if rumps is not None:
             self.glm_error = None
             self.cx_data = None
             self.cx_error = None
+            self.ts_data = None
+            self.ts_error = None
             self.result_queue = queue.Queue()
             self.poll_timer = rumps.Timer(self.on_poll, 0.5)
             self.refresh_timer = rumps.Timer(self.on_tick, REFRESH_INTERVAL)
@@ -648,7 +853,7 @@ if rumps is not None:
             # Poll queue on main thread to update UI
             try:
                 while True:
-                    ds, mm, ak, nm, km, glm, cx = self.result_queue.get_nowait()
+                    ds, mm, ak, nm, km, glm, cx, ts = self.result_queue.get_nowait()
                     self.ds_data, self.ds_error = ds
                     self.mm_data, self.mm_error = mm
                     self.ak_data, self.ak_error = ak
@@ -656,6 +861,7 @@ if rumps is not None:
                     self.km_data, self.km_error = km
                     self.glm_data, self.glm_error = glm
                     self.cx_data, self.cx_error = cx
+                    self.ts_data, self.ts_error = ts
                     self.update_title()
                     self._build_menu()
             except queue.Empty:
@@ -671,7 +877,7 @@ if rumps is not None:
             self.config = load_config()
             cfg = self.config
             disabled = lambda n: (None, "Disabled")
-            ds = mm = ak = nm = km = glm = cx = (None, None)
+            ds = mm = ak = nm = km = glm = cx = ts = (None, None)
             try:
                 ds = fetch_deepseek(cfg["deepseek_api_key"]) if is_enabled(cfg, "deepseek") else disabled("deepseek")
             except Exception as e:
@@ -700,7 +906,11 @@ if rumps is not None:
                 cx = fetch_codex() if is_enabled(cfg, "codex") else disabled("codex")
             except Exception as e:
                 cx = None, str(e)
-            self.result_queue.put((ds, mm, ak, nm, km, glm, cx))
+            try:
+                ts = fetch_typesafe(cfg.get("typesafe_cookie", "")) if is_enabled(cfg, "typesafe") else disabled("typesafe")
+            except Exception as e:
+                ts = None, str(e)
+            self.result_queue.put((ds, mm, ak, nm, km, glm, cx, ts))
 
         def _build_menu(self):
             if hasattr(self, '_menu'):
@@ -821,6 +1031,23 @@ if rumps is not None:
                 else:
                     items.append(rumps.MenuItem(f"Codex: {self.cx_error or 'N/A'}"))
                 items.append(None)
+            # TypeSafe console balance
+            if is_enabled(self.config, "typesafe"):
+                if self.ts_data:
+                    d = self.ts_data
+                    items.append(rumps.MenuItem(f"TypeSafe: ${d['balance']:.2f}"))
+                    items.append(rumps.MenuItem(f"  Spent this cycle: ${d['spent']:.2f}"))
+                    if d.get("plan"):
+                        items.append(rumps.MenuItem(f"  Plan: {d['plan']}"))
+                    if d.get("cycle"):
+                        items.append(rumps.MenuItem(f"  Cycle: {d['cycle']}"))
+                    for credit in d.get("credits", []):
+                        expiry = credit["expires_at"].split("T", 1)[0]
+                        items.append(rumps.MenuItem(
+                            f"  Credit: ${credit['remaining']:.2f}/${credit['amount']:.2f}, expires {expiry}"))
+                else:
+                    items.append(rumps.MenuItem(f"TypeSafe: {self.ts_error or 'N/A'}"))
+                items.append(None)
             items.append(rumps.MenuItem("Refresh", callback=self.refresh))
             self.menu = items
 
@@ -871,6 +1098,11 @@ if rumps is not None:
                     parts.append("CX:OUT" if self.cx_data["exhausted"] else f"CX:{self.cx_data['remaining_pct']}%")
                 else:
                     parts.append("CX:--")
+            if is_enabled(self.config, "typesafe"):
+                if self.ts_data:
+                    parts.append(f"TS:${self.ts_data['balance']:.2f}")
+                else:
+                    parts.append("TS:--")
             self.title = " ".join(parts)
 
 
@@ -1004,6 +1236,24 @@ def print_status():
                     if window.get("reset_at"):
                         line += f", reset {window['reset_at']}"
                     print(line)
+        except Exception as e:
+            print(f"  Error: {e}")
+
+    print("\nTypeSafe:")
+    if not is_enabled(config, "typesafe"):
+        print("  Disabled")
+    else:
+        try:
+            data, err = fetch_typesafe(config.get("typesafe_cookie", ""))
+            if err:
+                print(f"  Error: {err}")
+            else:
+                print(f"  Balance: ${data['balance']:.2f}")
+                print(f"  Spent this cycle: ${data['spent']:.2f}")
+                if data.get("plan"):
+                    print(f"  Plan: {data['plan']}")
+                if data.get("cycle"):
+                    print(f"  Cycle: {data['cycle']}")
         except Exception as e:
             print(f"  Error: {e}")
 
